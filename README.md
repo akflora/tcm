@@ -28,7 +28,7 @@ Prerequisites:
  * The MySQL/MariaDB command line client (`mysql`)
  * The Graphviz command line client (`dot`)
 
-Download the latest release from the [releases/](releases) directory.
+Download the latest release from the [releases/](https://github.com/akflora/tcm/releases) directory.
 
 ### 1. Script
 
