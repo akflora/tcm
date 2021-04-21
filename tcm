@@ -1,0 +1,1110 @@
+#!/bin/gawk -f
+
+# A webapp for managing Taxon Concept Mapping data with a MySQL DB
+# (c) Cam Webb <cw@camwebb.info> 2020-2021; License: GPL v3
+
+# Dev Notes
+#   - Variable case naming convention: CONFIG, Global, local
+#   - Gawk: use -L to lint and -d to check vars on regular basis
+#   - DB: use field types, foreign keys, and triggers to validate,
+#     and GRANT (only) SELECT to prevent user editing of Code Tables.
+#   - This code is based on a generic relational database access framework;
+#     Non-generic parts are indicated.
+
+# Program sections:
+#   - Configuration
+#   - Core App Logic
+#   - Function groups
+#      - Common page HTML
+#      - Select pages HTML
+#      - Insert/Update pages HTML
+#      - 'Preactions' - SQL action prior to generating page
+#      - Database functions
+#      - Utilities
+#      - Non-generic actions for TCM app (graph, exportRDF)
+
+@include "pw.awk"
+
+BEGIN{
+
+  # PROCESS COOKIES
+  if (ENVIRON["HTTP_SESSION"])
+    split(ENVIRON["HTTP_SESSION"], qs, "&")
+  for (q in qs) {
+    split(qs[q], qp, "=")
+    COOKIE[qp[1]] = substr(qp[2],1,200) # note, _not_ yet urldecoded
+  }
+
+  # ==================== CONFIGURATION (non-generic) ====================
+
+  PROCINFO["sorted_in"] = "@ind_str_asc"
+  DATABASE = "tcm"
+  APPNAME = "tcm"
+  # DEBUG = 1
+  LIMIT = 100  # max number of rows to show
+  
+  # Database config:
+  #  * table/field definitions - keep same as DB structure
+  #     table  { table_atts {
+  #              table, full_name, sort_field, foreign_show, select, filter } /
+  #     fields { field1 { fieldname, full_name, ci, grid_show , foreign_id? } ;
+  #           field2 ; ... | table2 | ...
+  #  * Fields not listed here will be ignored.
+  #  * Table full_name with a '0' will not be listed in navbar
+  #  * Use URL encoding (see 'man ascii')
+  #  * foreign_show, select and filter are SQL
+  Config = \
+    "pub , Publication , code , code , SELECT+%2A+FROM+%60pub%60,   /" \
+    "  id     , ID           , i , 0 ,     ;" \
+    "  code   , Code         , c , 1 ,     ;" \
+    "  pubtypeID , Pub+type  , i , 0 , pubtype;" \
+    "  author , Authors      , c , 0 ,     ;" \
+    "  year   , Year         , c , 1 ,     ;" \
+    "  title  , Title        , c , 1 ,     ;" \
+    "  journal, Journal+or+Book , c , 0 ,  ;" \
+    "  volume , Volume       , c , 0 ,     ;" \
+    "  pages  , Pages        , c , 0 ,     ;" \
+    "  publisher, Publisher  , c , 0 ,     ;" \
+    "  address, Address      , c , 0 ,     ;" \
+    "  doi    , DOI          , c , 1 ,     ;" \
+    "  url    , URL          , c , 1 ,     ;" \
+    "  bhlPf  ,BHL+pg1+ID    , i , 1 ,     ;" \
+    "  bhlPl  ,BHL+last+page+ID,i, 0 ,     ;" \
+    "  notes  , Notes        , n , 0 ,     |" \
+    "pubtype  , Pub+type0 , id , label, SELECT+%2A+FROM+%60pubtype%60 ,  /" \
+    "  id     , ID           , i , 0 ,     ;" \
+    "  label  , Label        , c , 1 ,     |" \
+    "name , Name , code , code, SELECT+%2A+FROM+%60name%60 , genus+REGEXP+%27" \
+      COOKIE["genregex"] "%27 /" \
+    "  id     , ID           , i , 0 ,     ;" \
+    "  code   , Code         , c , 1 ,     ;" \
+    "  genus  , Genus        , c , 1 ,     ;" \
+    "  species, species      , c , 1 ,     ;" \
+    "  irankID, rank         , i , 1 ,irank ;" \
+    "  infrasp, infrasp      , c , 1 ,     ;" \
+    "  author , Author       , c , 1 ,     ;" \
+    "  pubID  , Orig.+Publ.  , i , 1 , pub ;" \
+    "  url    , URL          , c , 0 ,     ;" \
+    "  notes  , Notes        , n , 0 ,     |" \
+    "irank , Infra+rank0 , id , label, SELECT+%2A+FROM+irank, /" \
+    "  id     , ID           , i , 0 ,     ;" \
+    "  label  , Label        , c , 1 ,     |" \
+    "tc , Taxon+Concept, tc.code,code, SELECT+tc.%2A+FROM+tc%2C+name , "\
+       "tc.nameID+%3D+name.id+AND+name.genus+REGEXP+%27" \
+       COOKIE["genregex"] "%27 /"                           \
+    "  id     , ID           , i , 0 ,     ;" \
+    "  code   , Code         , c , 1 ,     ;" \
+    "  nameID , Name         , i , 1 , name;" \
+    "  pubID  , Publication  , i , 1 , pub ;" \
+    "  bhlPf  ,BHL+pg1+ID    , i , 1 ,     ;" \
+    "  bhlPl  ,BHL+last+page+ID,i, 0 ,     ;" \
+    "  notes  , Notes        , n , 0 ,     |" \
+    "rel , Relationship0 , id , label , SELECT+%2A+FROM+%60rel%60 ,  /" \
+    "  id     , ID           , i , 0 ,     ;" \
+    "  label  , Label        , c , 1 ,     |" \
+    "syn , Synonym0 , id , label ,  SELECT+%2A+FROM+%60syn%60 ,       /" \
+    "  id     , ID           , i , 0 ,     ;" \
+    "  label  , Label        , c , 1 ,     |" \
+    "tcm , TC+Relationships , tc.code , id , SELECT+tcm.%2A%2C+tc.code+FROM+tcm+LEFT+JOIN+tc+ON+tc.id+%3D+tcm.tc1ID+LEFT+JOIN+tc+AS+TC1+ON+TC1.id+%3D+tcm.tc1ID+LEFT+JOIN+name+AS+N1+ON+N1.id+%3D+TC1.nameID+LEFT+JOIN+tc+AS+TC2+ON+TC2.id+%3D+tcm.tc2ID+LEFT+JOIN+name+AS+N2+ON+N2.id+%3D+TC2.nameID  , "               \
+      "%28N1.genus+REGEXP+%27" COOKIE["genregex"] "%27+OR+N2.genus+REGEXP+%27" \
+      COOKIE["genregex"] "%27%29   /"                             \
+    "  id     , ID           , i , 0 ,     ;" \
+    "  tc1ID  , TC1+newer     , i , 1 , tc ;" \
+    "  relID  , Relation     , i , 1 , rel ;" \
+    "  uncertain  , Uncertain , b , 0 ,    ;" \
+    "  synID  , Synonymy     , i , 1 , syn ;" \
+    "  tc2ID  , TC2+older    , i , 1 , tc  ;" \
+    "  pubID  ,  Publication , i , 1 , pub ;" \
+    "  graph  , Graph        , b , 1 ,     ;" \
+    "  notes  , Notes        , n , 0 ,      "
+  config()
+  db_secrets()
+
+  # ==================== APP LOGIC =======================================
+  
+  # READ QUERY STRING
+  split(ENVIRON["QUERY_STRING"], qs, "&")
+  for (q in qs) {
+    split(qs[q], qp, "=")
+    f[qp[1]] = substr(urldecode(qp[2]),1,2000)
+  }
+  clean_quotes();
+  
+  # DETERMINE AND EXECUTE METHOD
+  if (f["table"]) {
+    if (f["action"] == "show")
+      show()
+    else if ((f["action"] == "showone") && f["id"])
+      showone()
+    else if (f["action"] == "add")
+      addedit()
+    else if ((f["action"] == "edit") && f["id"])
+      addedit()
+  }
+  
+  # Non-generic
+  else if (f["action"] == "graph")
+    graph()
+  else if (f["action"] == "export")
+    exportRDF()
+
+  else defaultpage()
+  
+}
+
+# ========================= COMMON PAGE HTML =================================
+
+function header(title) {
+  # version history: [chars app] -> here
+  
+  # Use html5
+  print "Content-type: text/html\n"
+  print "<!DOCTYPE html>"
+  print "<html xmlns=\"http://www.w3.org/1999/xhtml\">"
+  print "<head><title>" title "</title>"
+  print "<meta http-equiv=\"Content-Type\" content=\"text/html; \
+           charset=utf-8\" />"
+  print "<link href=\"https://fonts.googleapis.com/css?family=Montserrat\" \
+           rel=\"stylesheet\"/>"
+  print "<link href=\"../img/akflora.png\" rel=\"shortcut icon\" \
+           type=\"image/x-icon\"/>"
+  print "<style>"
+  print "body { font-size: 14px; font-family: 'Montserrat', " \
+    "Verdana, Arial, Helvetica, sans-serif; }"
+  print ".main {width: 1000px; padding-top: 30px; margin-left: auto;"\
+    "  margin-right: auto; }"
+  print ".info {max-width: 600px; }"
+  print ".navbar { float: right; }"
+  print "h1 { padding-top:20px; }"
+  print "select , option { font-size: 14px }"
+  print "table { border-collapse: collapse }"
+  print "td, th { border: 1px solid black; padding: 5px }"
+  print "a { color:#15358d; text-decoration:none; border-bottom-style:none }"
+  print "a:visited { color:#9f1dbc }"
+  print "a:hover {color:#15358d; border-bottom-style:solid; \
+	     border-bottom-width:thin }"
+  print ".graph { max-width: 100%; }"
+  print "</style>"
+  print "</head>\n<body>"
+  print "<div class=\"main\">"
+}
+
+function navbar(  i, str) {
+  str = "<div class=\"navbar\">"
+  str = str "<a href=\"" APPNAME "\">Home</a>&#160;&#160;|&#160;&#160;"
+  for (i = 1; i <= length(Torder); i++)
+    if (Tlabel[Torder[i]] !~ /0/)
+      str = str "<a href=\"" APPNAME "?table=" Torder[i] "&amp;action=show\">" \
+        Tlabel[Torder[i]] "</a> (<a href=\"" APPNAME "?table=" Torder[i] \
+        "&amp;action=add\">+</a>)&#160;&#160;|&#160;&#160;"
+  gsub(/&#160;&#160;\|&#160;&#160;$/,"",str)
+
+  # Non-generic
+  str = str "&#160;&#160;|&#160;&#160;<a href=\"" APPNAME \
+    "?action=graph\">Graph</a>"
+
+  str = str "</div>"
+  print str
+  # correct the label, in case the table is a 'forced' display 
+  gsub(/0/,"",Tlabel[f["table"]])
+}
+
+function printdebug(msg) {
+  print "<div class=\"debugmsg\"><pre>" msg "</pre></div>"
+}
+
+function footer() {
+  print "</div>"
+  print "</body>\n</html>";
+}
+
+function defaultpage(   i) {
+  # Content Non-generic, but app must contain a default page
+
+  if ((f["preaction"] == "setcookie") && (f["genregex"])) {
+    print "X-Replace-Session: genregex=(" \
+      gensub(/ /,"","G", f["genregex"]) ")"
+  }
+  
+  header("TCM");
+  navbar()
+  
+  print "<h1>Taxonomic Concept Mapping</h1>"
+
+  if ((f["preaction"] == "setcookie") && (f["genregex"]))
+    print "<p style=\"color:green;\">Filter set to " f["genregex"] "</p>"
+  
+  print "<div class=\"info\">"
+  print "<h2>Usage</h2>"
+  print "<p>Add a new publication, then a name in that publication, " \
+    "then a taxonomic concept in that or another publication, then the "\
+    "relationship between that taxon concept and another.</p>"
+  print "<p>In the grid views, <b>V</b>: view single record, all fields,  "\
+    "<b>E</b>: edit record, <b>D</b>: delete record. Table codes in brackets"\
+    " (e.g., [tcm]) at end of row link to usages of that record in other "\
+    "tables.</p>"
+  print "<h2>Tools</h2>"
+  print "<ul>"
+  print "<li><form action=\"" APPNAME "\"><input type=\"hidden\" "      \
+    "name=\"preaction\" value=\"setcookie\"/><input type=\"submit\" "      \
+    "value=\"Work on\"/> only names, TCs, and TCMs for genus: "          \
+    "<input type=\"text\" name=\"genregex\" size=\"30\"/></form>"\
+    "Separate alternatives with a '|' symbol; the submitted text (between "\
+    "parentheses) is used as a regexp applied to genus names, and is "\
+    "stored as a session cookie.</li>"
+  print "<li><a href=\"" APPNAME "?action=export\">Export</a> Taxon Concepts"\
+    " and Taxon Concept Relationships as RDF (Turtle serialization), using "\
+    "the <a href=\"https://github.com/tdwg/ontology\">TDWG Ontology</a>.</li>"
+  print "</ul></div>"
+  
+  footer()
+}
+
+# ========================= HTML FOR DISPLAY PAGES ===========================
+
+function show(      x, n, i, j, k, sql, where) {
+  # version history: this is the original version
+
+  header(Tlabel[f["table"]])
+
+  navbar()
+  
+  print "<h1>" Tlabel[f["table"]] "</h1>"
+  
+  if (f["preaction"])
+    preaction()
+
+  ## NOT GENERIC
+  if (f["table"] == "tc")
+    print "<form action=\"" APPNAME "\">"
+  
+  print "<table>"
+
+  # check for linked tables
+  for (i in Tlabel)
+    for (j in Flabel[i])
+      if (Fforid[i][j] == f["table"]) {
+        backt[++k] = i
+        backf[k]   = j
+      }
+  
+  make_lookup(0)  # filter off: all foreign values looked up
+  
+  # Query DB
+  # filters
+  if(f["searchbox"])
+    # if search box, override the `show` = 1, etc.
+    # note that if the sort field is numeric, the search must be numeric
+    # which will not be possible for the user
+    where = " AND `" Tsort[f["table"]] "` LIKE '" \
+      gensub(/'/,"\\'","G",f["searchbox"]) "'"
+  else if (Tfilter[f["table"]])
+    where = " AND " Tfilter[f["table"]]
+
+  # add any GUI-created filters
+  if(f["where"]) 
+    where = where " AND " f["where"]
+
+  sql = Tselect[f["table"]] where " ORDER BY " Tsort[f["table"]] \
+    " LIMIT " LIMIT " ;"
+  if (DEBUG)
+    printdebug(sql)
+  db_query(DATABASE,  sql)
+
+  # Table header
+  print "<tr>"
+  for (i = 1; i <= length(Fgorder[f["table"]]); i++)
+    print "<th>" Flabel[f["table"]][Fgorder[f["table"]][i]] "</th>"
+  print "<th style=\"border:none;\"></th><th style=\"border:none;\"></th>"\
+    "<th style=\"border:none;\"></th>"
+
+  # backlinks
+  for (i in backt)
+    # print "<th style=\"font-size:smaller;\">used in<br/>" Tlabel[backt[i]] ":<br/>" Flabel[backt[i]][backf[i]] "</th>"
+    print "<th style=\"border:none;\"></th>"
+
+  ## NOT GENERIC
+  if (f["table"] == "tc")
+    print "<th style=\"border:none;\"></th>"
+  
+  print "</tr>"
+
+  # Table rows
+  for (i = 1; i <= DBQr; i++) {
+    print "<tr name=\"id" DBQ[i,"id"] "\">"
+    for (j = 1; j <= length(Fgorder[f["table"]]); j++) {
+      # show lookup value if the field is a foreign key
+      if (Fforid[f["table"]][Fgorder[f["table"]][j]]) {
+        print "<td><a href=\"" APPNAME "?table="                        \
+          Fforid[f["table"]][Fgorder[f["table"]][j]]                     \
+          "&amp;action=show&amp;where="                                 \
+          Fforid[f["table"]][Fgorder[f["table"]][j]] ".id%3D"           \
+          DBQ[i , Fgorder[f["table"]][j]]                               \
+          "\">"  Lookup[ Fforid[f["table"]][Fgorder[f["table"]][j]] ][  \
+            DBQ[i , Fgorder[f["table"]][j]]] "</a></td>"
+      }
+      else {
+        # special formatting
+        # DOIs and HTTP
+        if (tolower(Fgorder[f["table"]][j]) == "doi")
+          print "<td><a href=\"https://doi.org/" \
+            gensub(/^[dD][oO][iI]:/,"","G", DBQ[i,Fgorder[f["table"]][j]]) \
+            "\">" substr( DBQ[i,Fgorder[f["table"]][j]] , 1,15) "</a></td>"
+        # NON GENERIC:
+        else if (Fgorder[f["table"]][j] ~ /^bhlP/)
+          print "<td><a href=\"https://www.biodiversitylibrary.org/page/" \
+            DBQ[i,Fgorder[f["table"]][j]] "\">" DBQ[i,Fgorder[f["table"]][j]] \
+            "</a></td>"
+
+        else if (DBQ[i,Fgorder[f["table"]][j]] ~ /^https?/)
+          print "<td><a href=\"" DBQ[i,Fgorder[f["table"]][j]] "\">" \
+            substr( gensub(/^https?:\/\//,"","G",DBQ[i,Fgorder[f["table"]][j]])\
+                    , 1, 15) "</a></td>"
+        # if the field is long, but also if it is not the sort/code field
+        else if ((length(DBQ[i,Fgorder[f["table"]][j]]) > 20) && \
+                 (Fgorder[f["table"]][j] != Tsort[f["table"]]))
+          print "<td>" substr(DBQ[i,Fgorder[f["table"]][j]],1,20) "...</td>"
+        else print "<td>" DBQ[i,Fgorder[f["table"]][j]] "</td>"
+      }
+    }
+    
+
+    # View
+    print "<td style=\"border:none;\"><a href=\"" APPNAME "?table=" f["table"] \
+      "&amp;action=showone&amp;id=" DBQ[i,"id"] "\">V</a></td>"
+    # Edit
+    print "<td style=\"border:none;\"><a href=\"" APPNAME "?table=" f["table"] \
+      "&amp;action=edit&amp;id=" DBQ[i,"id"] "\">E</a></td>"
+    # Delete
+    print "<td style=\"border:none;\"><a href=\"" APPNAME "?table=" f["table"] \
+      "&amp;action=show&amp;preaction=delete&amp;id="                   \
+      DBQ[i,"id"] "\" onclick=\"return"                                 \
+      " confirm('Confirm deletion')\">D</a></td>"
+
+    # backlinks
+    for (j in backt)
+      print "<td style=\"border:none; font-size:smaller;\">"\
+        "<a href=\"" APPNAME "?table=" backt[j] "&amp;action=show&amp;where=" \
+        backt[j] "." backf[j] "%3D" DBQ[i,"id"] "\">[" backt[j] "]</a></td>"
+
+    ## NOT GENERIC
+    if (f["table"] == "tc")
+      print "<td style=\"border:none;\"><input type=\"checkbox\" name=\"tc" DBQ[i,"id"] \
+        "\" value=\"1\"/></td>"
+    
+    print "</tr>"
+  }
+  db_clear()
+
+  print "</table>"
+
+  ## NOT GENERIC
+  if (f["table"] == "tc") {
+    print "<input type=\"hidden\" name=\"action\" value=\"show\"/>"
+    print "<input type=\"hidden\" name=\"table\" value=\"tcm\"/>"
+    print "<input type=\"hidden\" name=\"preaction\" value=\"bc\"/>"
+    print "<p>"
+    print "<input type=\"submit\" value=\"Make congruent TCMs for checked TCs\"/>"
+    print "</p>"
+    print "</form>"
+  }
+  
+  print "<form action=\"" APPNAME "\"><p><a href=\"" APPNAME "?table=" f["table"] \
+    "&amp;action=add\">"
+  print "<b>Add</b></a>&#160;&#160;|&#160;&#160;<input type=\"hidden\" "\
+    "name=\"table\" value=\"" f["table"] "\"/><input type=\"hidden\" "\
+    "name=\"action\" value=\"show\"/><input type=\"text\" name=\"searchbox\" "\
+    "size=\"30\"/> <input type=\"submit\" value=\"Search\"/> "\
+    "<span style=\"font-size:smaller;\">(Searches on primary sort field; "\
+    "use '%' as wildcard)</span></p></form>"
+
+  footer()
+}
+
+
+function showone(      x, n, i, j, sel, sql) {
+  # version history: this is original version
+
+  header(Tlabel[f["table"]] ", record " f["id"])
+
+  navbar()
+  
+  print "<h1>" Tlabel[f["table"]] ", record " f["id"] "</h1>"
+
+  make_lookup(0)
+
+  sql = Tselect[f["table"]] " AND `" f["table"] "`.id = " f["id"] ";"
+  if (DEBUG)
+    printdebug(sql)
+  db_query(DATABASE, sql)
+  
+  print "<table>"
+  for (i = 1; i <= length(Forder[f["table"]]); i++) {
+    print "<tr>"
+    print "<td align=\"right\">" Flabel[f["table"]][Forder[f["table"]][i]] \
+      "</td>"
+    if (Fforid[f["table"]][Forder[f["table"]][i]])
+      print "<td><a href=\"" APPNAME "?table="                          \
+        Fforid[f["table"]][Forder[f["table"]][i]]                       \
+        "&amp;action=show#id" DBQ[1 , Forder[f["table"]][i]] "\">"      \
+        Lookup[ Fforid[f["table"]][Forder[f["table"]][i]] ][            \
+          DBQ[1 , Forder[f["table"]][i]]] "</a></td>"
+    
+    else {
+      # DOIs and HTTP
+      if (tolower(Forder[f["table"]][i]) == "doi")
+        print "<td><a href=\"https://doi.org/" \
+          gensub(/^[dD][oO][iI]:/,"","G", DBQ[1,Forder[f["table"]][i]]) \
+          "\">" DBQ[1,Forder[f["table"]][i]]  "</a></td>"
+
+      # NON GENERIC
+      else if (Forder[f["table"]][i] ~ /^bhlP/)
+        print "<td><a href=\"https://www.biodiversitylibrary.org/page/" \
+          DBQ[1,Forder[f["table"]][i]] "\">" DBQ[1,Forder[f["table"]][i]] \
+          "</a></td>"
+      
+      else if (substr(DBQ[1, Forder[f["table"]][i]],1,4) == "http")
+        print "<td><a href=\"" DBQ[1,Forder[f["table"]][i]] "\">" \
+          DBQ[1,Forder[f["table"]][i]] "</a></td>"
+      
+      else print "<td>" DBQ[1,Forder[f["table"]][i]] "</td>"
+    }
+    print "</tr>"
+  }
+  print "</table>"
+
+  print "<p><a href=\"" APPNAME "?table=" f["table"]                    \
+    "&amp;action=edit&amp;id=" f["id"] "\"><b>Edit</B></a>"             \
+    "&#160;&#160;|&#160;&#160;"                                         \
+    "<a href=\"" APPNAME "?table=" f["table"]                           \
+    "&amp;action=show&amp;preaction=delete&amp;id="                     \
+    f["id"] "\" onclick=\"return"                                       \
+    " confirm('Confirm deletion')\"><b>Delete</b></a></td>"
+  
+  db_clear()
+  footer()
+}
+
+# ========================= HTML FOR INSERT/UPDATE PAGES ====================
+
+function addedit(      x, n, i, j, sel, sql, schema) {
+  # version history: this is original version
+
+  if (f["action"] == "edit")
+    header("Editing " Tlabel[f["table"]] ", record " f["id"])
+  else if (f["action"] == "add")
+    header("New " Tlabel[f["table"]])
+  else defaultpage()
+
+  navbar()
+  
+  if (f["action"] == "edit") 
+    print "<h1>Editing " Tlabel[f["table"]] ", record " f["id"] "</h1>"
+  else if (f["action"] == "add")
+    print "<h1>New " Tlabel[f["table"]] " record</h1>"
+
+  make_lookup(1) # filter the lookups by cookie regexp value
+  
+  # # get NOT NULLs etc
+  # for (i in Tlabel)  
+  #   sql = sql "SHOW CREATE TABLE `" i "`; "
+  # schema = db_sql(DATABASE, sql)
+  # # print "<pre>" schema "</pre>"
+    
+  print "<form action=\"" APPNAME "\">"
+  print "<input type=\"hidden\" name=\"table\" value=\"" f["table"] "\"/>"
+  print "<input type=\"hidden\" name=\"action\" value=\"show\"/>"
+  print "<input type=\"hidden\" name=\"preaction\" value=\"" f["action"] "\"/>"
+
+  if (f["action"] == "edit") {
+    print "<input type=\"hidden\" name=\"id\" value=\"" f["id"] "\"/>"
+    sql = "SELECT * FROM `" f["table"] "` WHERE id = " f["id"] ";"
+    if (DEBUG)
+      printdebug(sql)
+    db_query(DATABASE, sql)
+  }
+
+  print "<table>"
+  for (i = 1; i <= length(Forder[f["table"]]); i++) {
+    print "<tr>"
+    print "<td align=\"right\">" Flabel[f["table"]][Forder[f["table"]][i]] \
+      "</td>"
+    
+    # if a Foreign ID, create dropdown
+    if (Fforid[f["table"]][Forder[f["table"]][i]]) {
+      print "<td>"
+      print "<select name=\"f-" Forder[f["table"]][i] "\" autocomplete=\"off\">"
+      # See for firefox bug: https://stackoverflow.com/questions/4831848/
+      #  firefox-ignores-option-selected-selected
+
+      # if value is NULL
+      if ((!DBQ[1, Forder[f["table"]][i]]) ||
+          (f["action"] == "add"))
+        print "<option value=\"NULL\" selected=\"selected\"></option>"
+      else
+        print "<option value=\"NULL\"></option>"
+
+      PROCINFO["sorted_in"] = "@val_str_asc"
+      for (j in Lookup[ Fforid[f["table"]][Forder[f["table"]][i]] ]) {
+        if (j == DBQ[1, Forder[f["table"]][i]])
+          sel = " selected=\"selected\""
+        else sel= ""
+        print "<option value=\"" j "\"" sel ">"                         \
+          Lookup[ Fforid[f["table"]][Forder[f["table"]][i]] ][j] "</option>"
+      }
+      PROCINFO["sorted_in"] = "@ind_str_asc"
+
+      # just in case the value does not appear in the Lookup, because of
+      # a filter (and is not NULL)
+      if (!Lookup[ Fforid[f["table"]][Forder[f["table"]][i]] ][       \
+          DBQ[1, Forder[f["table"]][i]] ] && (f["action"] == "edit" ) \
+          && (DBQ[1, Forder[f["table"]][i]]))
+        print "<option value=\"" DBQ[1, Forder[f["table"]][i]] "\"" \
+          " selected=\"selected\"" ">Record ID = " \
+          DBQ[1, Forder[f["table"]][i]]            \
+          " (currently hidden by filter)</option>"
+      # NB: this is needed because the !Lookup test above creates a new
+      #     array member if null (only spotted when Lookup reused)
+      delete Lookup[ Fforid[f["table"]][Forder[f["table"]][i]] ][ "" ]
+      print "</select>"
+      print "</td>"
+    }
+    else if (Ftype[f["table"]][Forder[f["table"]][i]] == "n")
+        print "<td><textarea style=\"height:100px;width:300px;\" name=\"f-" \
+          Forder[f["table"]][i] "\">" DBQ[1, Forder[f["table"]][i]] \
+          "</textarea></td>"
+    else if (Ftype[f["table"]][Forder[f["table"]][i]] == "b") {
+      # had previously used a checkbox, but this creates problems:
+      #   https://stackoverflow.com/a/1992745/563709
+      
+      print "<td>"
+      print "<select name=\"f-" Forder[f["table"]][i] "\" autocomplete=\"off\">"
+      if (DBQ[1, Forder[f["table"]][i]] == "0") {
+        print "<option value=\"NULL\"></option>"
+        print "<option value=\"0\" selected=\"selected\">no</option>"
+        print "<option value=\"1\">yes</option>"
+      }
+      else if (DBQ[1, Forder[f["table"]][i]] == "1") {
+        print "<option value=\"NULL\"></option>"
+        print "<option value=\"0\">no</option>"
+        print "<option value=\"1\" selected=\"selected\">yes</option>"
+      }
+      else {
+        print "<option value=\"NULL\" selected=\"selected\"></option>"
+        print "<option value=\"0\">no</option>"
+        print "<option value=\"1\">yes</option>"
+      }
+      print "</select>"
+      print "</td>"
+    }
+    
+    else
+        print "<td><input type=\"text\" name=\"f-" Forder[f["table"]][i] \
+          "\" size=\"30\" value=\"" DBQ[1, Forder[f["table"]][i]] "\"/></td>"
+    print "</tr>"
+  }
+  print "</table>"
+  print "<p><input type=\"submit\" value=\"GO\"/></p>"
+  print "</form>"
+
+  db_clear()
+  footer()
+}
+
+# ========================= SQL ACTIONS PRIOR TO PAGE VIEW ==================
+
+function preaction(     sql, i, j, err, bcid) {
+
+  if (f["preaction"] == "add") {
+    sql = "INSERT INTO `" f["table"] "` ("
+    for (i in f)
+      if (substr(i,1,2) == "f-")
+        sql = sql "`" substr(i,3) "`, "
+    gsub(/, $/,"",sql)
+    sql = sql ") VALUES ("
+    for (i in f)
+      if (substr(i,1,2) == "f-") {
+        # if blank, translate to NULL
+        if (!f[i])
+          sql = sql "NULL , "
+        else if ((Ftype[f["table"]][substr(i,3)] == "c") ||    \
+            (Ftype[f["table"]][substr(i,3)] == "n"))
+          sql = sql "'" f[i] "', "
+        else
+          sql = sql f[i] ", "
+      }
+    gsub(/, $/,"",sql)
+    sql = sql ");"
+    if (DEBUG)
+      printdebug(sql)
+    err = db_sql(DATABASE, sql)
+  }
+  
+  if (f["preaction"] == "edit") {
+    sql = "UPDATE `" f["table"] "` SET "
+    for (i in f)
+      if (substr(i,1,2) == "f-") {
+        sql = sql "`" substr(i,3) "` = "
+
+        # Translate NULLs
+        if (!f[i])
+          sql = sql "NULL , "
+        else if ((Ftype[f["table"]][substr(i,3)] == "c") || \
+            (Ftype[f["table"]][substr(i,3)] == "n"))
+          sql = sql "'" f[i] "', "
+        else
+          sql = sql f[i] ", "
+      }
+    gsub(/, $/,"",sql)
+    sql = sql " WHERE `id` = " f["id"] " ;"
+    if (DEBUG)
+      printdebug(sql)
+    err = db_sql(DATABASE, sql)
+  }
+  else if (f["preaction"] == "delete") {
+    sql = "DELETE FROM`" f["table"] "` WHERE id = " f["id"] ";"
+    if (DEBUG)
+      printdebug(sql)
+    err = db_sql(DATABASE, sql)
+  }
+
+  ## NOT GENERIC - batch creation of congruent
+  else if (f["preaction"] == "bc") {
+    # which tc IDs to make congruent?
+    for (i in f)
+      if (i ~ /^tc/) {
+        bcid[substr(i, 3)]++
+        nbc++
+      }
+
+    # check for 2 or more
+    if (nbc < 2)
+      err = "Only " (nbc + 0) " TCs checked. Two or more are needed"
+    else {
+      # get dates of the tcs
+      
+      db_query(DATABASE, "SELECT tc.id, pub.year FROM tc, pub WHERE "\
+               "tc.pubID = pub.id ORDER BY pub.year DESC;")
+      # run through all TCs newest to oldest, and check if any are selected
+      for (i = 1; i <= DBQr; i++)
+        if (bcid[DBQ[i, "id"]]) {
+          if (!tctmp)
+            tctmp = DBQ[i, "id"]
+          else {
+            tc1[++j] = tctmp
+            tc2[j]   = DBQ[i, "id"]
+            tctmp = DBQ[i, "id"]
+          }
+        }
+      db_clear()
+      for (i = 1; i <= j ; i++)
+        sql = sql                                                       \
+          "INSERT INTO tcm (tc1ID, relID, tc2ID, pubID, graph, notes)" \
+          " VALUES (" tc1[i] ", 2, " tc2[i] ", 46, 1, 'congruent batch'); "  
+
+      if (DEBUG)
+        printdebug(sql)
+      err = db_sql(DATABASE, sql)
+    }
+  }
+  
+  if (err)
+    print "<p style=\"color:red;\">FAILED: " err "</p>"
+  else print "<p style=\"color:green;\">Success</p>"
+}
+
+# =========================== DATABASE ============================
+
+function db_query(db, query            , row, i, cmd, preFS ) {
+  # version history: [awk-lib] -> [asriSMS] -> here
+
+  gsub(/`/,"\\`", query)  # if writing directly in awk script, need: \\\`
+  gsub(/\n/," ", query)
+  gsub(/  */," ", query)
+  cmd = "/bin/echo -e \"" query "\" | mysql --default-character-set=UTF8 -u " \
+    DBUSER[db] " -p" DBPASSWORD[db] " -h " DBHOST[db]                   \
+    " -B --column-names --default-character-set=utf8 " DBNAME[db] 
+  row = -1
+  preFS = FS
+  FS = "\t"
+  while ((cmd | getline ) > 0) {
+    row++
+    if (row == 0) {
+      DBQc = NF
+      for (i = 1; i <= NF; i++) DBQf[i] = $i
+    }
+    else {
+      for (i = 1; i <= NF; i++) {
+        gsub(/NULL/,"",$i)
+        DBQ[row, DBQf[i]] = $i
+      }
+    }
+  }
+  close(cmd)
+  # In the case of Empty Set
+  if (row == -1) row = 0
+  DBQr = row
+  FS = preFS
+}
+
+function db_clear() {
+
+  delete DBQ
+  delete DBQf
+  DBQr = 0
+  DBQc = 0
+}
+
+function db_sql(db, query            , cmd, inRS, mysqlout ) {
+  # version 2; history: [awk-lib] -> [asriSMS] -> here
+
+  gsub(/\n/," ",query)
+  gsub(/  */," ",query)
+  inRS = RS
+  RS = "\x04"
+  cmd = "mysql --default-character-set=UTF8 -u " DBUSER[db]         \
+    " -p" DBPASSWORD[db] " -h " DBHOST[db] " " DBNAME[db] " 2>&1"
+  # Not using system(). This way allows v long SQL statements.
+  # system() returns mysql exit code. Here, we send stderr to stdout
+  print query |& cmd
+  close(cmd, "to")
+  cmd |& getline mysqlout
+  close(cmd,"from")
+  RS = inRS
+  return mysqlout
+
+  # To check the db is accessible:
+  # e = db_sql("db", "SELECT '  OK' AS 'testing DB connection...';")
+  # if (e)
+  #   error("Database not accessible")
+
+  # 2020-10-09: spent a long time testing if the mysql process could
+  # be kept alive across several db actions in a program. Tried
+  # PROCINFO[cmd, "pty"] = 1, fflush(cmd), 'stdbuf -oL' and more.
+  # Seems that as soon as from pipe is closed, the child process
+  # terminates.  A FIFo approach may work:
+  #   https://stackoverflow.com/a/20297981/563709
+  # But MYSQL is efficient at handling many short connections:
+  #   https://mysqlserverteam.com/mysql-connection-handling-and-scaling/
+  # See also http://spawk.info/
+}
+
+
+# =========================== UTILITIES ================================
+
+function config(    t, t2, ta, fld, fa,     i, j, gocnt, locnt, tcnt) {
+  # Config:
+  #   table1 { table_atts { table, full_name, sort_field, foreign_show } /
+  #   fields { field1 { fieldname, full_name, ci, grid_show , foreign_id? } ;
+  #           field2 ; ... | table2 | ...
+  # order of tables and fields is used in display
+
+  gsub(/ /,"",Config)
+
+  # split into tables
+  tcnt = 1
+  split(Config, t, "|")
+  for (i in t) {
+
+    # split into table atts and fields
+    split(t[i],t2,"/")
+
+    # table atts
+    split(t2[1] ,ta,",")
+    Tlabel[ta[1]]   = urldecode(ta[2])
+    Tsort[ta[1]]    = urldecode(ta[3])
+    Torder[tcnt++]  = urldecode(ta[1])
+    Tforshow[ta[1]] = urldecode(ta[4])
+    Tselect[ta[1]]  = urldecode(ta[5])
+    Tfilter[ta[1]]  = urldecode(ta[6])
+
+    # ensure all select statements include a WHERE
+    if (Tselect[ta[1]] !~ /WHERE/)
+      Tselect[ta[1]] = Tselect[ta[1]] " WHERE TRUE"
+    
+    # fields
+    split(t2[2], fld, ";")
+    # go through fields, not including `id`
+    gocnt = locnt = 1
+    for (j = 2; j <= length(fld); j++) {
+      split(fld[j], fa, ",")
+      Flabel[ ta[1]][fa[1]]  = urldecode(fa[2])
+      Ftype[  ta[1]][fa[1]]  = fa[3] # c (char) or i (int)
+      if (fa[4])
+        Fgorder[ ta[1]][gocnt++] = fa[1]
+      Forder[ ta[1]][locnt++] = fa[1]
+      Fforid[ ta[1]][fa[1]]  = fa[5] 
+    }
+  }
+}
+
+function clean_quotes(   i) {
+   # clean text input in case of attempt to insert as SQL
+   for (i in f) {
+     gsub(/'/,"\\'", f[i])
+     gsub(/"/,"\\\"",f[i])
+   }
+}
+
+
+function make_lookup(filteron,       i, j, sql, already) {
+  # make lookups
+  for (i = 1; i <= length(Forder[f["table"]]); i++) {
+    
+    # only do it once per table, in case the table is referred mult. times
+    if (Fforid[f["table"]][Forder[f["table"]][i]] && \
+        !already[Fforid[f["table"]][Forder[f["table"]][i]]]) {
+      if (DEBUG)
+        printdebug("Making lookup " Fforid[f["table"]][Forder[f["table"]][i]]) 
+      
+      # if filter on (for dropdowns)
+      if (Tfilter[ Fforid[f["table"]][Forder[f["table"]][i]] ] && filteron)
+        sql = "SELECT `" Fforid[f["table"]][Forder[f["table"]][i]] "`.id, `" \
+          Fforid[f["table"]][Forder[f["table"]][i]] "`."                \
+          Tforshow[Fforid[f["table"]][Forder[f["table"]][i]]]           \
+          " AS `_lookup` FROM " gensub(/^.*FROM/,"","G",                \
+              Tselect[Fforid[f["table"]][Forder[f["table"]][i]]])       \
+          " AND " Tfilter[Fforid[f["table"]][Forder[f["table"]][i]] ] " ;"
+      else
+        sql = "SELECT id, "                                     \
+          Tforshow[Fforid[f["table"]][Forder[f["table"]][i]]]   \
+          " AS `_lookup` FROM `"                                \
+          Fforid[f["table"]][Forder[f["table"]][i]] "` ;" 
+      
+      if (DEBUG)
+        printdebug(sql)
+      db_query(DATABASE, sql)
+      for (j = 1; j <= DBQr; j++) {
+        Lookup[Fforid[f["table"]][Forder[f["table"]][i]]][DBQ[j,"id"]] = \
+          DBQ[j, "_lookup"]
+      }
+      db_clear()
+      already[Fforid[f["table"]][Forder[f["table"]][i]]] = 1
+    }
+  }
+}
+
+
+function urldecode(text,   hex, i, hextab, decoded, len, c, c1, c2, code) {
+# decode urlencoded string
+# urldecode function from Heiner Steven
+#   http://www.shelldorado.com/scripts/cmds/urldecode
+# version 1
+	
+  split("0 1 2 3 4 5 6 7 8 9 a b c d e f", hex, " ")
+  for (i=0; i<16; i++) hextab[hex[i+1]] = i
+  
+  decoded = ""
+  i = 1
+  len = length(text)
+  
+  while ( i <= len ) {
+    c = substr (text, i, 1)
+    if ( c == "%" ) {
+      if ( i+2 <= len ) {
+        c1 = tolower(substr(text, i+1, 1))
+        c2 = tolower(substr(text, i+2, 1))
+        if ( hextab [c1] != "" || hextab [c2] != "" ) {
+          # print "Read: %" c1 c2;
+          # Allow: 
+          # 20 begins main chars, but dissallow 7F (wrong in orig code!)
+          #   tab, newline, formfeed, carriage return
+          if ( ( (c1 >= 2) && ((c1 c2) != "7f") )   \
+               || (c1 == 0 && c2 ~ "[9acd]") )
+            {
+              code = 0 + hextab [c1] * 16 + hextab [c2] + 0
+              # print "Code: " code
+              c = sprintf ("%c", code)
+            } else {
+            # for dissallowed chars
+            c = " "
+          }
+          i = i + 2
+        }
+      }
+    } else if ( c == "+" ) 	# special handling: "+" means " "
+      c = " "
+    decoded = decoded c
+    ++i
+  }
+  
+  # change linebreaks to \n
+  gsub(/\r\n/, "\n", decoded);
+  # remove last linebreak
+  gsub(/[\n\r]*$/,"",decoded);
+  return decoded
+}
+
+# =========================== NON-GENERIC ================================
+
+function graph(   floras, flora, i, gv, node, j, florarank, map) {
+  # Generate a graph using graphviz
+
+  header("TCM graph");
+  navbar()
+  
+  print "<h1>TCM graph</h1>"
+
+  # for now... only one fig at a time
+  # "mktemp -d" | getline dir
+  # close("mktemp -d")
+  
+  elab[1] = "[style=dotted,dir=none," # intersects
+  elab[2] = "[dir=none,"              # congruent
+  elab[3] = "[style=dashed,dir=none," # overlaps
+  elab[4] = "[style=dashed,dir=back," # includes
+  elab[5] = "[style=dashed," # is included in
+  elab[6] = "[color=red,dir=none,"    # disjunct
+  
+  db_query(DATABASE, "SELECT tcm.id AS ID, TC1.id AS TC1ID, TC1.code AS TC1, "\
+           "tcm.relID AS R, TC2.id AS TC2ID, TC2.code AS TC2, tcm.`graph`, "\
+           "tcm.notes AS N FROM tcm LEFT JOIN tc ON tc.id = tcm.tc1ID LEFT JOIN tc AS TC1 ON "\
+           "TC1.id = tcm.tc1ID LEFT JOIN name AS N1 ON N1.id = TC1.nameID "\
+           "LEFT JOIN tc AS TC2 ON TC2.id = tcm.tc2ID LEFT JOIN name AS N2 "\
+           "ON N2.id = TC2.nameID WHERE tcm.`graph` = 1 AND (N1.genus REGEXP '"\
+           urldecode(COOKIE["genregex"]) "' OR N2.genus REGEXP '"\
+           urldecode(COOKIE["genregex"]) "') ORDER BY tc.code LIMIT 110;")
+  
+  if (DBQr > 120) {
+    print "<p>Sorry, cannot display a graph of more than 100 taxonomic" \
+      " concepts.<br/>Suggest un-showing some of the completed concept chains;"\
+      "<br/>the graph choices will not be lost.</p>"
+    footer()
+    exit 1
+  }
+
+  # Modify this if you have a set of standard publications you are mapping
+  #   among - if the phrase appears in the text string label for the taxon
+  #   concept, it will be aligned with other TCs with the same string.
+  floras = "PAF|FNA|Cody|Welsh|Hult[eé]n"
+  split(floras,flora,"|")
+  
+  gv = "digraph structure { \n"                     \
+    "  rankdir=\"TB\"; \n"                          \
+    "  node [fontname=\"Helvetica\",shape=box]; \n"                 \
+    "  edge [fontname=\"Courier\", len=1.5, arrowhead=normal, fontcolor=red]; \n" \
+    "  newrank=true; \n\n"
+
+  for (i = 1; i <= DBQr; i++) {
+    if (!node[DBQ[i, "TC1ID"]]) {
+      gv = gv "node" DBQ[i, "TC1ID"] " [label=\"" DBQ[i, "TC1"] "\",URL=\"" \
+        APPNAME "?action=showone&amp;table=tc&amp;id=" DBQ[i, "TC1ID"] "\"]; \n"
+      node[DBQ[i, "TC1ID"]]++
+      for (j in flora)
+        if (DBQ[i, "TC1"] ~ (" " flora[j]))     \
+          florarank[j][DBQ[i, "TC1ID"]]++
+    }
+    if (!node[DBQ[i, "TC2ID"]]) {
+      gv = gv "node" DBQ[i, "TC2ID"] " [label=\"" DBQ[i, "TC2"] "\",URL=\"" \
+        APPNAME "?action=showone&amp;table=tc&amp;id=" DBQ[i, "TC2ID"] "\"]; \n"
+      node[DBQ[i, "TC2ID"]]++
+      for (j in flora)
+        if (DBQ[i, "TC2"] ~ (" " flora[j]))                 \
+          florarank[j][DBQ[i, "TC2ID"]]++
+    }
+    if (DBQ[i,"N"])
+      notemark = "label=\"*\","
+    else
+      notemark = ""
+    gv = gv "node" DBQ[i, "TC1ID"] " -> node" DBQ[i, "TC2ID"] " "       \
+      elab[DBQ[i, "R"]] notemark "tooltip=\"" gensub(/"/,"\\\\\"","G",DBQ[i,"N"])  "\",URL=\"" APPNAME \
+      "?action=showone&amp;table=tcm&amp;id=" DBQ[i, "ID"] "\"]; \n"
+  }
+  gv = gv "\n"
+
+  for (i in flora) {
+    rankstring = ""
+    if (isarray(florarank[i])) {
+      for (j in florarank[i])
+        rankstring = rankstring "node" j " ;"
+      gsub(/ ;$/,"",rankstring)
+      gv = gv "  { rank=same; " rankstring "}\n"
+    }
+  }
+  
+  gv = gv "}"
+  db_clear()
+
+  # don't forget to make tmp/ chmod a+w
+  print gv > "tmp/graph.dot"
+  system("dot -Tcmapx -otmp/graph.map -Tjpg -otmp/graph.jpg tmp/graph.dot")
+  RS="\x04"
+  getline map < "tmp/graph.map"
+
+  print "<div class=\"graph\">"
+  print map
+  print "<img src=\"tmp/graph.jpg\" usemap=\"#structure\"/>"
+  print "<p>Nodes and edges are clickable. Hover over edges that are marked with <span style=\"color:red\">*</span> to see notes.<br/>Edge style key:</p>"
+  print "<ul style=\"list-style-type:none\"><li>Solid black: <i>congruent with</i> (=)</li>"
+  print "<li>Dashed black: <i>overlaps</i> (&gt;&lt;)</li>"
+  print "<li>Dotted black: <i>intersects</i> (∩)</li>"
+  print "<li>Dashed black with arrow: &lt;arrow from&gt; <i>is included in</i>"\
+    " &lt;arrow to&gt; (&lt;)</li>"
+  print "<li>Solid red: <i>is disjunct from</i> (|)</li></ul>"
+  print "</div>"
+  
+  footer()
+}
+
+
+function exportRDF(   i, relcode, relcodes) {
+
+  print "Content-type: text/html\n"
+  print "<!DOCTYPE html>"
+  print "<html xmlns=\"http://www.w3.org/1999/xhtml\">"
+  print "<head><title>Taxon concept relationship RDF dump</title>"
+  print "<meta http-equiv=\"Content-Type\" content=\"text/html; \
+           charset=utf-8\" />"
+  print "</head><body><pre>"
+
+  print "@prefix : &lt;#&gt; ."
+  print "@prefix tc: &lt;http://rs.tdwg.org/ontology/voc/TaxonConcept#&gt; ."
+  print "@prefix sem: &lt;http://semanticweb.cs.vu.nl/2009/11/sem/&gt; ."
+  print "@prefix rdfs: &lt;http://www.w3.org/2000/01/rdf-schema#&gt; .\n"
+  print "# Taxon Concepts\n"
+
+  # Taxon concepts
+  db_query(DATABASE, "SELECT tc.id AS ID, tc.code AS L, CONCAT_WS(' ', genus,"\
+           " species, irank.label, "                                    \
+           "infrasp, name.author) AS N, CONCAT_WS(', ', pub.author, pub.year," \
+           " pub.title, pub.journal, pub.volume, pub.pages, pub.publisher, "\
+           "pub.address) AS P FROM tc, pub, name LEFT JOIN irank ON "\
+           "irank.id = name.irankID WHERE tc.nameID  = name.id AND "\
+           "tc.pubID = pub.id ;")
+
+  for (i = 1; i <= DBQr; i++) {
+    print ":TC" DBQ[i, "ID"] " a tc:TaxonConcept ;" 
+    print "  rdfs:label           \"" gensub(/"/,"\\\"","G", DBQ[i, "L"]) "\" ;"
+    print "  tc:nameString        \"" gensub(/"/,"\\\"","G", DBQ[i, "N"]) "\" ;"
+    print "  tc:accordingToString \"" gensub(/"/,"\\\"","G", DBQ[i, "P"]) \
+      "\" .\n"  
+  }  
+
+  db_clear()
+  
+  print "# Taxon Concept Relationships\n"
+  
+  # TC relationships
+  db_query(DATABASE, "SELECT tcm.id, tcm.tc1ID, tcm.relID, tcm.tc2ID, "\
+           "tcm.notes, CONCAT_WS(', ', pub.author, pub.year," \
+           " pub.title, pub.journal, pub.volume, pub.pages, pub.publisher, "\
+           "pub.address) AS P FROM tcm LEFT JOIN pub ON tcm.pubID = pub.id; ")
+  relcodes =  ":Intersects|tc:IsCongruentTo|tc:Overlaps|tc:Includes|"\
+    "tc:IsIncludedIn|tc:Excludes"
+  split(relcodes, relcode, "|")
+  
+  for (i = 1; i <= DBQr; i++) {
+    print ":TCrel" DBQ[i, "id"] " a tc:Relationship ;"
+    print "  tc:fromTaxon            :TC" DBQ[i, "tc1ID"] " ;"
+    print "  tc:relationshipCategory " relcode[DBQ[i, "relID"]] " ;"
+    print "  tc:toTaxon              :TC" DBQ[i, "tc2ID"] " ;"
+    if ((DBQ[i, "notes"]) && (DBQ[i, "notes"] != "congruent batch"))
+      print "  rdfs:comment            \"" gensub(/"/,"'","G",       \
+                                                  DBQ[i, "notes"]) "\" ;"
+    print "  sem:accordingTo         \"" gensub(/"/,"\\\"","G", DBQ[i,"P"]) \
+      "\" .\n"
+  }
+  db_clear()
+
+  print "</pre></body></html>"
+}
